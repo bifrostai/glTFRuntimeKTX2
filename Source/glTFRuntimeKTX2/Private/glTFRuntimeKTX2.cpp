@@ -8,6 +8,69 @@ THIRD_PARTY_INCLUDES_END
 
 #define LOCTEXT_NAMESPACE "FglTFRuntimeKTX2Module"
 
+// Mapping table is provided by the class as a private static helper
+const FglTFRuntimeKTX2Module::FFormatPair* FglTFRuntimeKTX2Module::GetMappingTable(int32& OutNumEntries)
+{
+    static const FFormatPair Mappings[] = {
+        // Uncompressed formats
+        { EPixelFormat::PF_B8G8R8A8, (int32)KTX_TTF_RGBA32 },
+
+        // BC/DXT formats (desktop)
+        { EPixelFormat::PF_DXT1, (int32)KTX_TTF_BC1_RGB },
+        { EPixelFormat::PF_DXT5, (int32)KTX_TTF_BC3_RGBA },
+        { EPixelFormat::PF_BC4, (int32)KTX_TTF_BC4_R },
+        { EPixelFormat::PF_BC5, (int32)KTX_TTF_BC5_RG },
+        { EPixelFormat::PF_BC7, (int32)KTX_TTF_BC7_RGBA },
+    };
+
+    OutNumEntries = sizeof(Mappings) / sizeof(Mappings[0]);
+    return Mappings;
+}
+
+int32 FglTFRuntimeKTX2Module::GetKTXFormatFromUnrealPixelFormat(EPixelFormat UnrealFormat)
+{
+    // Ensure the Unreal pixel format is supported on this platform
+    if (UnrealFormat <= EPixelFormat::PF_Unknown || UnrealFormat >= EPixelFormat::PF_MAX)
+    {
+        return static_cast<int32>(0x7fffffff);
+    }
+    if (!GPixelFormats[UnrealFormat].Supported)
+    {
+        return static_cast<int32>(0x7fffffff);
+    }
+
+    int32 Count = 0;
+    const FFormatPair* Table = GetMappingTable(Count);
+    for (int32 i = 0; i < Count; ++i)
+    {
+        const FFormatPair& Pair = Table[i];
+        if (Pair.Unreal == UnrealFormat)
+        {
+            return Pair.Ktx;
+        }
+    }
+    return static_cast<int32>(0x7fffffff); // KTX_TTF_NOSELECTION
+}
+
+EPixelFormat FglTFRuntimeKTX2Module::GetUnrealPixelFormatFromKTXFormat(int32 KTXFormat)
+{
+    int32 Count = 0;
+    const FFormatPair* Table = GetMappingTable(Count);
+    for (int32 i = 0; i < Count; ++i)
+    {
+        const FFormatPair& Pair = Table[i];
+        if (Pair.Ktx == KTXFormat)
+        {
+            // Only return formats supported on this platform
+            if (Pair.Unreal > EPixelFormat::PF_Unknown && Pair.Unreal < EPixelFormat::PF_MAX && GPixelFormats[Pair.Unreal].Supported)
+            {
+                return Pair.Unreal;
+            }
+        }
+    }
+    return EPixelFormat::PF_Unknown;
+}
+
 void FglTFRuntimeKTX2Module::StartupModule()
 {
 	// extract the right ImageIndex
@@ -23,7 +86,7 @@ void FglTFRuntimeKTX2Module::StartupModule()
 		});
 
 	// check if we have mips
-	FglTFRuntimeParser::OnTextureMips.AddLambda([](TSharedRef<FglTFRuntimeParser> Parser, const int32 TextureIndex, TSharedRef<FJsonObject> JsonTextureObject, TSharedRef<FJsonObject> JsonImageObject, const TArray64<uint8>& Bytes, TArray<FglTFRuntimeMipMap>& Mips, const FglTFRuntimeImagesConfig& ImagesConfig)
+	FglTFRuntimeParser::OnTextureMips.AddLambda([](TSharedRef<FglTFRuntimeParser> Parser, const int32 TextureIndex, TSharedRef<FJsonObject> JsonTextureObject, TSharedRef<FJsonObject> JsonImageObject, const TArray64<uint8>& CompressedBytes, TArray<FglTFRuntimeMipMap>& Mips, const FglTFRuntimeImagesConfig& ImagesConfig)
 		{
 			// skip if already processed
 			if (Mips.Num() > 0)
@@ -50,11 +113,31 @@ void FglTFRuntimeKTX2Module::StartupModule()
 				}
 			}
 
-			ktxTexture2* KTX2Texture;
-			KTX_error_code KTXResult;
-			ktx_size_t KTX2Offset;
+			// Determine transcoding format from ForcePixelFormat
+			if (ImagesConfig.ForcePixelFormat == EPixelFormat::PF_Unknown)
+			{
+				return;
+			}
 
-			KTXResult = ktxTexture2_CreateFromMemory(Bytes.GetData(), Bytes.Num(), KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT, &KTX2Texture);
+            ktx_transcode_fmt_e TranscodeFormat = static_cast<ktx_transcode_fmt_e>(FglTFRuntimeKTX2Module::GetKTXFormatFromUnrealPixelFormat(ImagesConfig.ForcePixelFormat));
+			// If format not supported, skip
+			if (TranscodeFormat == static_cast<ktx_transcode_fmt_e>(0x7fffffff)) // KTX_TTF_NOSELECTION
+			{
+				return;
+			}
+
+			// make sure its a format we can transcode
+            if (FglTFRuntimeKTX2Module::GetUnrealPixelFormatFromKTXFormat(static_cast<int32>(TranscodeFormat)) == EPixelFormat::PF_Unknown)
+			{
+				Parser->AddError("FglTFRuntimeKTX2Module::StartupModule()", "Unsupported KTX2 transcoding format");
+				return;
+			}
+
+			ktxTexture2* KTX2Texture = nullptr;
+			KTX_error_code KTXResult = KTX_UNSUPPORTED_TEXTURE_TYPE;
+			ktx_size_t KTX2Offset = 0;
+
+			KTXResult = ktxTexture2_CreateFromMemory(CompressedBytes.GetData(), CompressedBytes.Num(), KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT, &KTX2Texture);
 			if (KTXResult != KTX_SUCCESS)
 			{
 				if (KTXResult != KTX_UNKNOWN_FILE_FORMAT)
@@ -69,30 +152,37 @@ void FglTFRuntimeKTX2Module::StartupModule()
 				EPixelFormat PixelFormat = EPixelFormat::PF_B8G8R8A8;
 				if (ktxTexture2_NeedsTranscoding(KTX2Texture))
 				{
-					if (ImagesConfig.ForcePixelFormat == EPixelFormat::PF_B8G8R8A8)
+					KTXResult = ktxTexture2_TranscodeBasis(KTX2Texture, TranscodeFormat, 0);
+					if (KTXResult != KTX_SUCCESS)
 					{
-						KTXResult = ktxTexture2_TranscodeBasis(KTX2Texture, KTX_TTF_RGBA32, 0);
-						if (KTXResult != KTX_SUCCESS)
-						{
-							ktxTexture_Destroy(ktxTexture(KTX2Texture));
-							Parser->AddError("FglTFRuntimeKTX2Module::StartupModule()", "Unable to transcode KTX2 texture");
-							return;
-						}
+						ktxTexture_Destroy(ktxTexture(KTX2Texture));
+						Parser->AddError("FglTFRuntimeKTX2Module::StartupModule()", "Unable to transcode KTX2 texture");
+						return;
 					}
-					else
+					// Use the format we transcoded to (from ForcePixelFormat or CVAR)
+					if (ImagesConfig.ForcePixelFormat != EPixelFormat::PF_Unknown)
 					{
-						KTXResult = ktxTexture2_TranscodeBasis(KTX2Texture, KTX_TTF_BC3_RGBA, 0);
-						if (KTXResult != KTX_SUCCESS)
+						PixelFormat = ImagesConfig.ForcePixelFormat;
+					}
+                    else
+                    {
+                        PixelFormat = FglTFRuntimeKTX2Module::GetUnrealPixelFormatFromKTXFormat(static_cast<int32>(TranscodeFormat));
+						if (PixelFormat == EPixelFormat::PF_Unknown)
 						{
 							ktxTexture_Destroy(ktxTexture(KTX2Texture));
-							Parser->AddError("FglTFRuntimeKTX2Module::StartupModule()", "Unable to transcode KTX2 texture");
+							Parser->AddError("FglTFRuntimeKTX2Module::StartupModule()", "Unsupported KTX2 transcoded pixel format");
 							return;
 						}
-
-						PixelFormat = EPixelFormat::PF_DXT5;
 					}
 				}
-
+				else
+				{
+					// This is highly unlikely that we can use the KTX2 as-is. We'll implement it in the future
+					// if we need to with specific use cases which there isn't right now
+					ktxTexture_Destroy(ktxTexture(KTX2Texture));
+					Parser->AddError("FglTFRuntimeKTX2Module::StartupModule()", "KTX2 texture does not need transcoding, unsupported path");
+					return;
+				}
 				int32 MipWidth = KTX2Texture->baseWidth;
 				int32 MipHeight = KTX2Texture->baseHeight;
 
@@ -106,7 +196,7 @@ void FglTFRuntimeKTX2Module::StartupModule()
 						return;
 					}
 
-					ktx_uint8_t* KTX2ImageData = ktxTexture_GetData(ktxTexture(KTX2Texture)) + KTX2Offset;
+					ktx_uint8_t* const KTX2ImageData = ktxTexture_GetData(ktxTexture(KTX2Texture)) + KTX2Offset;
 					const int64 ImageSize = ktxTexture_GetImageSize(ktxTexture(KTX2Texture), MipIndex);
 
 					FglTFRuntimeMipMap Mip(TextureIndex);
