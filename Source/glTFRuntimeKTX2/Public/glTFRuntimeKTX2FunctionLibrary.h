@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "glTFRuntimeAsset.h"
+
 #include "glTFRuntimeKTX2FunctionLibrary.generated.h"
 
 /**
@@ -23,4 +24,3 @@ public:
 	 */
 	static bool IsAssetKTX2Compressed(UglTFRuntimeAsset* Asset);
 };
-
